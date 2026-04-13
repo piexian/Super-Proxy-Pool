@@ -2,6 +2,7 @@ package subscriptions
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"super-proxy-pool/internal/db"
@@ -23,6 +25,8 @@ type Service struct {
 	settingsSvc *settings.Service
 	events      *events.Broker
 	client      *http.Client
+	mu          sync.Mutex
+	syncing     map[int64]struct{}
 }
 
 type UpsertRequest struct {
@@ -44,8 +48,35 @@ func NewService(store *db.Store, settingsSvc *settings.Service, broker *events.B
 		store:       store,
 		settingsSvc: settingsSvc,
 		events:      broker,
-		client:      &http.Client{Timeout: 30 * time.Second},
+		client: &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				Proxy:             http.ProxyFromEnvironment,
+				ForceAttemptHTTP2: false,
+				TLSClientConfig: &tls.Config{
+					MinVersion: tls.VersionTLS12,
+				},
+			},
+		},
+		syncing: make(map[int64]struct{}),
 	}
+}
+
+func (s *Service) StartScheduler(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		s.runDueSyncs(ctx)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				s.runDueSyncs(ctx)
+			}
+		}
+	}()
 }
 
 func (s *Service) List(ctx context.Context) ([]models.Subscription, error) {
@@ -160,7 +191,16 @@ func (s *Service) ToggleNode(ctx context.Context, subscriptionID, nodeID int64) 
 }
 
 func (s *Service) Sync(ctx context.Context, id int64) (SyncOutcome, error) {
+	if !s.beginSync(id) {
+		return SyncOutcome{}, errors.New("subscription sync already running")
+	}
+	defer s.endSync(id)
+
 	sub, err := s.Get(ctx, id)
+	if err != nil {
+		return SyncOutcome{}, err
+	}
+	settingsRow, err := s.settingsSvc.Get(ctx)
 	if err != nil {
 		return SyncOutcome{}, err
 	}
@@ -168,6 +208,7 @@ func (s *Service) Sync(ctx context.Context, id int64) (SyncOutcome, error) {
 	if err != nil {
 		return SyncOutcome{}, err
 	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Super-Proxy-Pool)")
 	for key, value := range parseHeaders(sub.HeadersJSON) {
 		req.Header.Set(key, value)
 	}
@@ -178,7 +219,7 @@ func (s *Service) Sync(ctx context.Context, id int64) (SyncOutcome, error) {
 		req.Header.Set("If-Modified-Since", sub.LastModified)
 	}
 
-	resp, err := s.client.Do(req)
+	resp, err := s.doWithRetry(req, settingsRow.FailureRetryCount)
 	if err != nil {
 		_ = s.setSyncFailure(ctx, sub.ID, err.Error())
 		return SyncOutcome{}, err
@@ -362,6 +403,72 @@ func defaultJSON(raw string) string {
 		return "{}"
 	}
 	return raw
+}
+
+func (s *Service) doWithRetry(req *http.Request, retryCount int) (*http.Response, error) {
+	attempts := retryCount + 1
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		cloned := req.Clone(req.Context())
+		resp, err := s.client.Do(cloned)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if attempt < attempts-1 {
+			time.Sleep(time.Duration(attempt+1) * 300 * time.Millisecond)
+		}
+	}
+	return nil, lastErr
+}
+
+func (s *Service) runDueSyncs(ctx context.Context) {
+	items, err := s.List(ctx)
+	if err != nil {
+		return
+	}
+	now := time.Now().UTC()
+	for _, item := range items {
+		if !shouldSyncSubscription(item, now) {
+			continue
+		}
+		id := item.ID
+		go func() {
+			_, _ = s.Sync(ctx, id)
+		}()
+	}
+}
+
+func shouldSyncSubscription(item models.Subscription, now time.Time) bool {
+	if !item.Enabled {
+		return false
+	}
+	if item.SyncIntervalSec <= 0 {
+		return false
+	}
+	if item.LastSyncAt == nil {
+		return true
+	}
+	return !item.LastSyncAt.Add(time.Duration(item.SyncIntervalSec) * time.Second).After(now)
+}
+
+func (s *Service) beginSync(id int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, exists := s.syncing[id]; exists {
+		return false
+	}
+	s.syncing[id] = struct{}{}
+	return true
+}
+
+func (s *Service) endSync(id int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.syncing, id)
 }
 
 func errorSummary(errs []error) string {

@@ -15,7 +15,7 @@ type ParseResult struct {
 }
 
 func ParseSubscriptionContent(content string) ParseResult {
-	content = strings.TrimSpace(content)
+	content = normalizeSubscriptionContent(content)
 	if content == "" {
 		return ParseResult{Errors: []error{errors.New("subscription content is empty")}}
 	}
@@ -49,7 +49,7 @@ func ParseSubscriptionContent(content string) ParseResult {
 }
 
 func decodeMaybeBase64(input string) string {
-	raw := strings.ReplaceAll(strings.TrimSpace(input), "\n", "")
+	raw := strings.ReplaceAll(normalizeSubscriptionContent(input), "\n", "")
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
 		decoded, err = base64.RawStdEncoding.DecodeString(raw)
@@ -58,4 +58,11 @@ func decodeMaybeBase64(input string) string {
 		}
 	}
 	return string(decoded)
+}
+
+func normalizeSubscriptionContent(input string) string {
+	input = strings.TrimSpace(input)
+	input = strings.TrimPrefix(input, "\uFEFF")
+	input = strings.ReplaceAll(input, "\r\n", "\n")
+	return input
 }

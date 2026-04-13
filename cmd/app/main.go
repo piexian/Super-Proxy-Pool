@@ -68,6 +68,7 @@ func main() {
 		log.Printf("mihomo start skipped: %v", err)
 	}
 	probeSvc.Start(context.Background())
+	subSvc.StartScheduler(context.Background())
 
 	webApp, err := web.New(authSvc, settingsSvc, nodeSvc, subSvc, poolSvc, probeSvc, broker)
 	if err != nil {
