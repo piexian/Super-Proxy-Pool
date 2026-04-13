@@ -39,7 +39,10 @@ type Manager struct {
 }
 
 func NewManager(opts Options) *Manager {
-	_, err := exec.LookPath(opts.BinaryPath)
+	resolvedBinary, err := exec.LookPath(opts.BinaryPath)
+	if err == nil {
+		opts.BinaryPath = resolvedBinary
+	}
 	return &Manager{
 		opts:      opts,
 		hasBinary: err == nil,

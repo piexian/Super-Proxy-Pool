@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -45,6 +46,7 @@ type App struct {
 func Load() App {
 	dataDir := getenv("DATA_DIR", defaultDataDir())
 	runtimeDir := filepath.Join(dataDir, "runtime")
+	cwd, _ := os.Getwd()
 
 	return App{
 		PanelHost:               getenv("PANEL_HOST", defaultPanelHost),
@@ -54,7 +56,7 @@ func Load() App {
 		RuntimeDir:              runtimeDir,
 		ProdConfigPath:          filepath.Join(runtimeDir, "mihomo-prod.yaml"),
 		ProbeConfigPath:         filepath.Join(runtimeDir, "mihomo-probe.yaml"),
-		MihomoBinaryPath:        getenv("MIHOMO_BINARY", defaultMihomoBinary()),
+		MihomoBinaryPath:        resolveMihomoBinary(cwd, os.Getenv("MIHOMO_BINARY")),
 		ProdControllerAddr:      getenv("PROD_CONTROLLER_ADDR", defaultProdControllerAddr),
 		ProbeControllerAddr:     getenv("PROBE_CONTROLLER_ADDR", defaultProbeControllerAddr),
 		ProbeMixedPort:          getenvInt("PROBE_MIXED_PORT", defaultProbeMixedPort),
@@ -110,10 +112,92 @@ func defaultDataDir() string {
 }
 
 func defaultMihomoBinary() string {
-	if runtime.GOOS == "windows" {
+	return defaultMihomoBinaryFor(runtime.GOOS)
+}
+
+func defaultMihomoBinaryFor(goos string) string {
+	if goos == "windows" {
 		return "mihomo.exe"
 	}
 	return "/usr/local/bin/mihomo"
+}
+
+func resolveMihomoBinary(baseDir, override string) string {
+	if override != "" {
+		return override
+	}
+	for _, candidate := range mihomoBinaryCandidates(baseDir, runtime.GOOS, runtime.GOARCH) {
+		if resolved, err := exec.LookPath(candidate); err == nil {
+			return resolved
+		}
+	}
+	return defaultMihomoBinary()
+}
+
+func mihomoBinaryCandidates(baseDir, goos, goarch string) []string {
+	name := mihomoBinaryName(goos)
+	platformName := mihomoPlatformBinaryName(goos, goarch)
+	locations := [][]string{
+		{"bin"},
+		{"tools"},
+		{"deployments", "bin"},
+		nil,
+	}
+	var candidates []string
+	if baseDir != "" {
+		for _, location := range locations {
+			for _, binaryName := range []string{name, platformName} {
+				if binaryName == "" {
+					continue
+				}
+				parts := append([]string{baseDir}, location...)
+				parts = append(parts, binaryName)
+				candidates = append(candidates, filepath.Join(parts...))
+			}
+		}
+	}
+	candidates = append(candidates, defaultMihomoBinaryFor(goos), name)
+	if goos == "windows" {
+		candidates = append(candidates, "mihomo")
+	}
+	if platformName != "" {
+		candidates = append(candidates, platformName)
+	}
+	return uniqueStrings(candidates)
+}
+
+func mihomoBinaryName(goos string) string {
+	if goos == "windows" {
+		return "mihomo.exe"
+	}
+	return "mihomo"
+}
+
+func mihomoPlatformBinaryName(goos, goarch string) string {
+	if goos == "" || goarch == "" {
+		return ""
+	}
+	name := "mihomo-" + goos + "-" + goarch
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name
+}
+
+func uniqueStrings(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func randomHex(n int) string {

@@ -1,83 +1,133 @@
 # Super-Proxy-Pool
 
-Go + SQLite + Mihomo proxy pool management panel.
+基于 Go + SQLite + Mihomo 的代理池管理面板。项目提供：
 
-Current repository status:
+- 密码登录的管理面板
+- 订阅管理
+- 手动节点管理
+- 多代理池管理
+- Mihomo 生产实例和探测实例配置下发
+- 节点延迟测试、可选测速、SSE 状态推送
 
-- Phase 1 is implemented end-to-end: project structure, SQLite init, login/session auth, four management pages, settings CRUD, manual node CRUD, subscription CRUD, proxy pool CRUD, SSE event channel, Docker build skeleton.
-- Phase 2+ entry points already exist: subscription sync parser, node test queue API, pool member management, Mihomo manager placeholder.
-- The panel can start now and the main data path is usable. Mihomo hot publish, active probe execution, and richer runtime stats will be filled on top of this base.
+当前仓库已经可以直接启动，适合继续迭代和部署。
 
-## Default behavior
+## 默认配置
 
-- Panel listen: `0.0.0.0:7890`
-- Default password: `admin`
-- SQLite path: `/data/app.db` in Docker, `./data/app.db` on Windows local development
-- Default subscription sync interval: `3600`
-- Default latency URL: `https://www.gstatic.com/generate_204`
-- Speed test is off by default
+- 面板地址：`0.0.0.0:7890`
+- 默认密码：`admin`
+- SQLite：
+  - Docker：`/data/app.db`
+  - Windows 本地开发：`./data/app.db`
+- 默认订阅同步间隔：`3600` 秒
+- 默认延迟测试 URL：`https://www.gstatic.com/generate_204`
+- 测速：默认关闭
 
-## Local run
+## 本地开发
+
+### 依赖
+
+- Go `1.25+`
+- Mihomo 可执行文件
+
+说明：
+
+- 面板本身支持直接 `go run ./cmd/app`
+- 即使本地没有 Mihomo，面板也可以启动，CRUD、配置生成、页面开发都可用
+- 如果要真实发布代理池、执行延迟测试、执行测速，需要能找到 Mihomo 二进制
+
+### Mihomo 自动发现规则
+
+启动时按下面顺序查找 Mihomo：
+
+1. 环境变量 `MIHOMO_BINARY`
+2. 仓库内常见路径
+   - `./bin/mihomo` 或 `./bin/mihomo.exe`
+   - `./tools/mihomo` 或 `./tools/mihomo.exe`
+   - `./deployments/bin/mihomo` 或 `./deployments/bin/mihomo.exe`
+   - `./mihomo` 或 `./mihomo.exe`
+3. 系统 `PATH`
+4. 默认路径
+   - Linux/macOS：`/usr/local/bin/mihomo`
+   - Windows：`mihomo.exe`
+
+建议开发时直接把 Mihomo 放在仓库根目录下的 `bin/`。
+
+### Windows
+
+直接运行：
+
+```powershell
+go run ./cmd/app
+```
+
+或者使用启动脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployments\dev.ps1
+```
+
+自定义端口或二进制路径：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deployments\dev.ps1 `
+  -PanelPort 7891 `
+  -MihomoBinary C:\tools\mihomo.exe
+```
+
+启动后访问：
+
+- [http://127.0.0.1:7890/login](http://127.0.0.1:7890/login)
+
+### Linux / macOS
+
+直接运行：
 
 ```bash
 go run ./cmd/app
 ```
 
-Then open:
+或者使用启动脚本：
 
-- [http://127.0.0.1:7890/login](http://127.0.0.1:7890/login)
+```bash
+bash ./deployments/dev.sh
+```
 
-## What is already available
+自定义参数：
 
-### Login
+```bash
+bash ./deployments/dev.sh --port 7891 --mihomo-binary /usr/local/bin/mihomo
+```
 
-- Password-only login page
-- Session cookie auth
-- Password stored as bcrypt hash in SQLite
-- Password change in system settings page
+### 运行测试
 
-### Subscription management
+```bash
+go test ./...
+```
 
-- Create, update, delete subscriptions
-- Manual sync trigger API
-- Subscription detail page
-- YAML / Base64 / URI-list parsing logic is in place
+## Docker 部署
 
-### Manual node management
-
-- Import raw nodes from:
-  - single URI
-  - multiple URI lines
-  - Mihomo YAML `proxies` fragments
-- Edit / delete / toggle nodes
-- Latency and speed test trigger API endpoints are present
-
-### Proxy pools
-
-- Create multiple pools
-- HTTP / SOCKS protocol selection
-- Port conflict validation against panel port and other pools
-- Member selection from manual nodes and subscription nodes
-- Publish endpoint and state fields are in place
-
-### System settings
-
-- Panel host and port
-- Probe URLs, timeout, concurrency, speed limits
-- Controller secret
-- Default subscription interval
-- Log level
-- Restart button
-
-## Docker deployment
-
-### Build
+### 构建
 
 ```bash
 docker build -t super-proxy-pool .
 ```
 
-### Run
+### 方式 A：Host 网络，推荐
+
+适用于 Linux 服务器。优点是新增代理池端口时不需要重新发布容器端口。
+
+```bash
+docker run -d \
+  --name super-proxy-pool \
+  --network host \
+  --restart unless-stopped \
+  -v $PWD/data:/data \
+  super-proxy-pool
+```
+
+### 方式 B：Bridge 网络 + 预开放端口范围
+
+如果不能使用 host 网络，就提前映射一段端口范围，例如 `18080-18120`。之后在系统设置里约束代理池只使用该范围。
 
 ```bash
 docker run -d \
@@ -89,90 +139,142 @@ docker run -d \
   super-proxy-pool
 ```
 
-## docker-compose
+### docker-compose
 
-Bridge mode with pre-opened pool port range:
+仓库自带示例：
 
 ```bash
 docker compose up -d super-proxy-pool
 ```
 
-Host networking profile:
+Host 网络配置：
 
 ```bash
 docker compose --profile host up -d super-proxy-pool-host
 ```
 
-## Host network vs bridge
+## 常用操作
 
-### Option A: host network
+### 登录
 
-Recommended for Linux servers.
+1. 打开 `/login`
+2. 输入默认密码 `admin`
+3. 首次进入后建议立刻在“系统设置”里修改密码
 
-Why:
+### 添加订阅
 
-- New proxy pool ports do not need container port re-publishing.
-- Operationally simpler when pool ports change frequently.
+1. 进入“订阅管理”
+2. 新建订阅，填写名称和订阅 URL
+3. 保存后点击“立即同步”
+4. 在订阅详情里查看解析到的节点卡片
 
-### Option B: bridge + pre-opened port range
+支持的订阅内容：
 
-Recommended only when host networking is unavailable.
+- Mihomo / Clash YAML
+- Base64 编码后的 URI 列表
+- 纯文本 URI 列表
 
-Why:
+### 添加手动节点
 
-- Container stays isolated.
-- You must pre-map a fixed port range, for example `18080-18120`.
-- Pool listen ports must stay inside the mapped range.
+1. 进入“节点管理”
+2. 粘贴以下任一种内容
+   - 单条 URI
+   - 多条 URI
+   - Mihomo `proxies` YAML 片段
+3. 保存后可在节点卡片上直接测试延迟、测速、启用或禁用
 
-## Common operations
+支持的手动节点协议：
 
-### Add a subscription
+- `ss://`
+- `trojan://`
+- `vmess://`
+- `vless://`
+- `hysteria2://`
+- `tuic://`
+- Mihomo YAML proxy 片段
 
-1. Open `订阅管理`.
-2. Fill in subscription name and URL.
-3. Save.
-4. Click `立即同步`.
+### 创建代理池
 
-### Add manual nodes
+1. 进入“代理池设置”
+2. 新建代理池
+3. 选择协议 `http` 或 `socks`
+4. 设置监听地址和端口
+5. 从手动节点和订阅节点中选择成员
+6. 保存后点击“刷新发布”
 
-1. Open `节点管理`.
-2. Paste one or more URIs or a Mihomo YAML fragment.
-3. Save.
+系统会校验：
 
-### Create a proxy pool
+- 代理池端口不能和面板端口冲突
+- 代理池端口之间不能冲突
 
-1. Open `代理池设置`.
-2. Set pool name, protocol, host and port.
-3. Choose members from manual nodes and subscription nodes.
-4. Save.
+### 修改密码
 
-### Change password
+1. 进入“系统设置”
+2. 在面板设置中输入旧密码和新密码
+3. 保存后会立即生效，并需要重新登录
 
-1. Open `系统设置`.
-2. Enter old password and new password.
-3. Submit the password form.
+### 重启系统
 
-### Restart system
+1. 进入“系统设置”
+2. 页面底部点击“重启系统”
+3. Docker 环境下建议必须开启 restart policy
 
-1. Open `系统设置`.
-2. Click `重启系统`.
-3. In Docker, make sure restart policy is enabled.
+行为说明：
 
-## Tests
+- 程序会先持久化配置
+- 再停止 Mihomo 子进程
+- 最后退出主进程
+- 由 Docker 的重启策略重新拉起
 
-```bash
-go test ./...
+## 当前实现情况
+
+### 已完成
+
+- SQLite 自动建表与迁移
+- bcrypt 密码存储与登录会话
+- 四个管理页面和左侧固定导航
+- 订阅 CRUD、同步、详情节点列表
+- 手动节点 CRUD、解析、卡片操作
+- 代理池 CRUD、成员管理、配置发布
+- 双 Mihomo 配置文件生成
+- 节点延迟测试队列
+- 可选测速任务队列
+- SSE 事件流
+- Docker 单镜像部署
+
+### 说明
+
+- 本地没有 Mihomo 时，面板依然可用于开发和数据录入，但真实探测与转发不会生效
+- 只要 Mihomo 二进制可用，程序会自动启动 `mihomo-prod` 和 `mihomo-probe`
+
+## 关键环境变量
+
+- `DATA_DIR`：数据目录
+- `DB_PATH`：SQLite 文件路径
+- `MIHOMO_BINARY`：Mihomo 二进制路径
+- `PANEL_HOST`：面板监听地址
+- `PANEL_PORT`：面板监听端口
+- `PROD_CONTROLLER_ADDR`：生产实例 controller 地址
+- `PROBE_CONTROLLER_ADDR`：探测实例 controller 地址
+- `PROBE_MIXED_PORT`：探测实例 mixed 端口
+
+## 目录结构
+
+```text
+cmd/app
+internal/auth
+internal/config
+internal/db
+internal/events
+internal/mihomo
+internal/models
+internal/nodes
+internal/pools
+internal/probe
+internal/settings
+internal/subscriptions
+internal/web
+web/templates
+web/static
+deployments
 ```
-
-Covered now:
-
-- subscription parser
-- manual node parser
-- port conflict validation
-- password hash/verify
-
-## Notes on Mihomo
-
-- The Docker image downloads Mihomo from the official MetaCubeX GitHub release assets.
-- The Dockerfile exposes `MIHOMO_VERSION` and `MIHOMO_ASSET` as build args, so you can adjust the asset name if upstream naming changes.
-- Runtime manager and config file paths are already wired under `/data/runtime`.
