@@ -1,0 +1,387 @@
+package subscriptions
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"super-proxy-pool/internal/db"
+	"super-proxy-pool/internal/events"
+	"super-proxy-pool/internal/models"
+	"super-proxy-pool/internal/nodes"
+	"super-proxy-pool/internal/settings"
+)
+
+type Service struct {
+	store       *db.Store
+	settingsSvc *settings.Service
+	events      *events.Broker
+	client      *http.Client
+}
+
+type UpsertRequest struct {
+	Name            string `json:"name"`
+	URL             string `json:"url"`
+	HeadersJSON     string `json:"headers_json"`
+	Enabled         bool   `json:"enabled"`
+	SyncIntervalSec int    `json:"sync_interval_sec"`
+}
+
+type SyncOutcome struct {
+	CreatedCount int      `json:"created_count"`
+	FailedCount  int      `json:"failed_count"`
+	Errors       []string `json:"errors"`
+}
+
+func NewService(store *db.Store, settingsSvc *settings.Service, broker *events.Broker) *Service {
+	return &Service{
+		store:       store,
+		settingsSvc: settingsSvc,
+		events:      broker,
+		client:      &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func (s *Service) List(ctx context.Context) ([]models.Subscription, error) {
+	rows, err := s.store.DB.QueryContext(ctx, `SELECT id, name, url, headers_json, enabled, sync_interval_sec, last_sync_at,
+		last_sync_status, last_error, etag, last_modified, created_at, updated_at
+		FROM subscriptions ORDER BY updated_at DESC, id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []models.Subscription
+	for rows.Next() {
+		item, err := scanSubscription(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Service) Get(ctx context.Context, id int64) (models.Subscription, error) {
+	row := s.store.DB.QueryRowContext(ctx, `SELECT id, name, url, headers_json, enabled, sync_interval_sec, last_sync_at,
+		last_sync_status, last_error, etag, last_modified, created_at, updated_at
+		FROM subscriptions WHERE id = ?`, id)
+	return scanSubscription(row)
+}
+
+func (s *Service) Create(ctx context.Context, req UpsertRequest) (models.Subscription, error) {
+	if req.SyncIntervalSec <= 0 {
+		st, err := s.settingsSvc.Get(ctx)
+		if err != nil {
+			return models.Subscription{}, err
+		}
+		req.SyncIntervalSec = st.DefaultSubscriptionIntervalSec
+	}
+	now := time.Now().UTC()
+	res, err := s.store.DB.ExecContext(ctx, `INSERT INTO subscriptions (
+		name, url, headers_json, enabled, sync_interval_sec, created_at, updated_at
+	) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		req.Name, req.URL, defaultJSON(req.HeadersJSON), boolToInt(req.Enabled), req.SyncIntervalSec, now, now,
+	)
+	if err != nil {
+		return models.Subscription{}, err
+	}
+	id, _ := res.LastInsertId()
+	item, err := s.Get(ctx, id)
+	if err == nil {
+		s.events.Publish("subscriptions.created", item)
+	}
+	return item, err
+}
+
+func (s *Service) Update(ctx context.Context, id int64, req UpsertRequest) (models.Subscription, error) {
+	_, err := s.store.DB.ExecContext(ctx, `UPDATE subscriptions SET name = ?, url = ?, headers_json = ?, enabled = ?, sync_interval_sec = ?, updated_at = ?
+		WHERE id = ?`, req.Name, req.URL, defaultJSON(req.HeadersJSON), boolToInt(req.Enabled), req.SyncIntervalSec, time.Now().UTC(), id)
+	if err != nil {
+		return models.Subscription{}, err
+	}
+	item, err := s.Get(ctx, id)
+	if err == nil {
+		s.events.Publish("subscriptions.updated", item)
+	}
+	return item, err
+}
+
+func (s *Service) Delete(ctx context.Context, id int64) error {
+	_, err := s.store.DB.ExecContext(ctx, `DELETE FROM subscriptions WHERE id = ?`, id)
+	if err == nil {
+		s.events.Publish("subscriptions.deleted", map[string]int64{"id": id})
+	}
+	return err
+}
+
+func (s *Service) ListNodes(ctx context.Context, subscriptionID int64) ([]models.SubscriptionNode, error) {
+	rows, err := s.store.DB.QueryContext(ctx, `SELECT id, subscription_id, display_name, protocol, server, port, raw_payload, normalized_json,
+		enabled, last_latency_ms, last_speed_mbps, last_status, last_test_at, last_speed_at, last_error, created_at, updated_at
+		FROM subscription_nodes WHERE subscription_id = ? ORDER BY updated_at DESC, id DESC`, subscriptionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []models.SubscriptionNode
+	for rows.Next() {
+		item, err := scanSubscriptionNode(rows)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
+func (s *Service) GetNode(ctx context.Context, subscriptionID, nodeID int64) (models.SubscriptionNode, error) {
+	row := s.store.DB.QueryRowContext(ctx, `SELECT id, subscription_id, display_name, protocol, server, port, raw_payload, normalized_json,
+		enabled, last_latency_ms, last_speed_mbps, last_status, last_test_at, last_speed_at, last_error, created_at, updated_at
+		FROM subscription_nodes WHERE subscription_id = ? AND id = ?`, subscriptionID, nodeID)
+	return scanSubscriptionNode(row)
+}
+
+func (s *Service) ToggleNode(ctx context.Context, subscriptionID, nodeID int64) (models.SubscriptionNode, error) {
+	current, err := s.GetNode(ctx, subscriptionID, nodeID)
+	if err != nil {
+		return models.SubscriptionNode{}, err
+	}
+	_, err = s.store.DB.ExecContext(ctx, `UPDATE subscription_nodes SET enabled = ?, updated_at = ? WHERE id = ? AND subscription_id = ?`,
+		boolToInt(!current.Enabled), time.Now().UTC(), nodeID, subscriptionID)
+	if err != nil {
+		return models.SubscriptionNode{}, err
+	}
+	return s.GetNode(ctx, subscriptionID, nodeID)
+}
+
+func (s *Service) Sync(ctx context.Context, id int64) (SyncOutcome, error) {
+	sub, err := s.Get(ctx, id)
+	if err != nil {
+		return SyncOutcome{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sub.URL, nil)
+	if err != nil {
+		return SyncOutcome{}, err
+	}
+	for key, value := range parseHeaders(sub.HeadersJSON) {
+		req.Header.Set(key, value)
+	}
+	if sub.ETag != "" {
+		req.Header.Set("If-None-Match", sub.ETag)
+	}
+	if sub.LastModified != "" {
+		req.Header.Set("If-Modified-Since", sub.LastModified)
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		_ = s.setSyncFailure(ctx, sub.ID, err.Error())
+		return SyncOutcome{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		err := fmt.Errorf("subscription fetch failed: %s", resp.Status)
+		_ = s.setSyncFailure(ctx, sub.ID, err.Error())
+		return SyncOutcome{}, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return SyncOutcome{}, err
+	}
+	result := ParseSubscriptionContent(string(body))
+	if len(result.Nodes) == 0 {
+		err := errors.New("no nodes parsed from subscription")
+		_ = s.setSyncFailure(ctx, sub.ID, err.Error())
+		return SyncOutcome{}, err
+	}
+
+	tx, err := s.store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return SyncOutcome{}, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM subscription_nodes WHERE subscription_id = ?`, sub.ID); err != nil {
+		return SyncOutcome{}, err
+	}
+	now := time.Now().UTC()
+	for _, item := range result.Nodes {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO subscription_nodes (
+			subscription_id, display_name, protocol, server, port, raw_payload, normalized_json, enabled, last_status, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 1, 'unknown', ?, ?)`,
+			sub.ID, item.DisplayName, item.Protocol, item.Server, item.Port, item.RawPayload, nodes.NormalizeJSON(item.Normalized), now, now,
+		); err != nil {
+			return SyncOutcome{}, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE subscriptions SET last_sync_at = ?, last_sync_status = ?, last_error = ?, etag = ?, last_modified = ?, updated_at = ?
+		WHERE id = ?`, now, "ok", errorSummary(result.Errors), resp.Header.Get("ETag"), resp.Header.Get("Last-Modified"), now, sub.ID); err != nil {
+		return SyncOutcome{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return SyncOutcome{}, err
+	}
+	outcome := SyncOutcome{
+		CreatedCount: len(result.Nodes),
+		FailedCount:  len(result.Errors),
+		Errors:       stringifyErrors(result.Errors),
+	}
+	s.events.Publish("subscriptions.synced", map[string]any{"subscription_id": id, "outcome": outcome})
+	return outcome, nil
+}
+
+func (s *Service) AllRuntimeNodes(ctx context.Context) ([]models.RuntimeNode, error) {
+	rows, err := s.store.DB.QueryContext(ctx, `SELECT id, display_name, protocol, server, port, raw_payload, normalized_json, enabled, last_status FROM subscription_nodes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []models.RuntimeNode
+	for rows.Next() {
+		var item models.RuntimeNode
+		item.SourceType = "subscription"
+		if err := rows.Scan(&item.SourceNodeID, &item.DisplayName, &item.Protocol, &item.Server, &item.Port, &item.RawPayload, &item.NormalizedJSON, &item.Enabled, &item.LastStatus); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (s *Service) ListPoolCandidates(ctx context.Context) ([]models.PoolMemberView, error) {
+	rows, err := s.store.DB.QueryContext(ctx, `SELECT n.id, n.display_name, n.protocol, n.server, n.port, n.enabled, n.last_status, n.last_latency_ms, n.last_speed_mbps, s.name
+		FROM subscription_nodes n JOIN subscriptions s ON s.id = n.subscription_id
+		ORDER BY s.name ASC, n.display_name ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []models.PoolMemberView
+	for rows.Next() {
+		var item models.PoolMemberView
+		item.SourceType = "subscription"
+		if err := rows.Scan(&item.SourceNodeID, &item.DisplayName, &item.Protocol, &item.Server, &item.Port, &item.Enabled, &item.LastStatus, &item.LastLatencyMS, &item.LastSpeedMbps, &item.SourceLabel); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, rows.Err()
+}
+
+func (s *Service) NodeBySource(ctx context.Context, id int64) (models.RuntimeNode, error) {
+	row := s.store.DB.QueryRowContext(ctx, `SELECT id, display_name, protocol, server, port, raw_payload, normalized_json, enabled, last_status
+		FROM subscription_nodes WHERE id = ?`, id)
+	var item models.RuntimeNode
+	item.SourceType = "subscription"
+	err := row.Scan(&item.SourceNodeID, &item.DisplayName, &item.Protocol, &item.Server, &item.Port, &item.RawPayload, &item.NormalizedJSON, &item.Enabled, &item.LastStatus)
+	return item, err
+}
+
+func (s *Service) UpdateProbeResult(ctx context.Context, sourceNodeID int64, latency *int64, speed *float64, status, errMsg string, isSpeed bool) error {
+	now := time.Now().UTC()
+	if isSpeed {
+		_, err := s.store.DB.ExecContext(ctx, `UPDATE subscription_nodes SET last_speed_mbps = ?, last_speed_at = ?, last_status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+			speed, now, status, errMsg, now, sourceNodeID)
+		return err
+	}
+	_, err := s.store.DB.ExecContext(ctx, `UPDATE subscription_nodes SET last_latency_ms = ?, last_test_at = ?, last_status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+		latency, now, status, errMsg, now, sourceNodeID)
+	return err
+}
+
+func (s *Service) setSyncFailure(ctx context.Context, id int64, message string) error {
+	_, err := s.store.DB.ExecContext(ctx, `UPDATE subscriptions SET last_sync_status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
+		"failed", message, time.Now().UTC(), id)
+	return err
+}
+
+func scanSubscription(scanner interface{ Scan(dest ...any) error }) (models.Subscription, error) {
+	var item models.Subscription
+	var enabled int
+	var lastSyncAt sql.NullTime
+	err := scanner.Scan(&item.ID, &item.Name, &item.URL, &item.HeadersJSON, &enabled, &item.SyncIntervalSec, &lastSyncAt,
+		&item.LastSyncStatus, &item.LastError, &item.ETag, &item.LastModified, &item.CreatedAt, &item.UpdatedAt)
+	if err != nil {
+		return models.Subscription{}, err
+	}
+	item.Enabled = enabled == 1
+	if lastSyncAt.Valid {
+		v := lastSyncAt.Time
+		item.LastSyncAt = &v
+	}
+	return item, nil
+}
+
+func scanSubscriptionNode(scanner interface{ Scan(dest ...any) error }) (models.SubscriptionNode, error) {
+	var item models.SubscriptionNode
+	var enabled int
+	var latency sql.NullInt64
+	var speed sql.NullFloat64
+	var lastTestAt sql.NullTime
+	var lastSpeedAt sql.NullTime
+	err := scanner.Scan(
+		&item.ID, &item.SubscriptionID, &item.DisplayName, &item.Protocol, &item.Server, &item.Port, &item.RawPayload, &item.NormalizedJSON,
+		&enabled, &latency, &speed, &item.LastStatus, &lastTestAt, &lastSpeedAt, &item.LastError, &item.CreatedAt, &item.UpdatedAt,
+	)
+	if err != nil {
+		return models.SubscriptionNode{}, err
+	}
+	item.Enabled = enabled == 1
+	if latency.Valid {
+		v := latency.Int64
+		item.LastLatencyMS = &v
+	}
+	if speed.Valid {
+		v := speed.Float64
+		item.LastSpeedMbps = &v
+	}
+	if lastTestAt.Valid {
+		v := lastTestAt.Time
+		item.LastTestAt = &v
+	}
+	if lastSpeedAt.Valid {
+		v := lastSpeedAt.Time
+		item.LastSpeedAt = &v
+	}
+	return item, nil
+}
+
+func parseHeaders(raw string) map[string]string {
+	var headers map[string]string
+	_ = json.Unmarshal([]byte(defaultJSON(raw)), &headers)
+	return headers
+}
+
+func defaultJSON(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return "{}"
+	}
+	return raw
+}
+
+func errorSummary(errs []error) string {
+	if len(errs) == 0 {
+		return ""
+	}
+	return errs[0].Error()
+}
+
+func stringifyErrors(errs []error) []string {
+	out := make([]string, 0, len(errs))
+	for _, err := range errs {
+		out = append(out, err.Error())
+	}
+	return out
+}
+
+func boolToInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
+}

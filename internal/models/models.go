@@ -1,0 +1,150 @@
+package models
+
+import "time"
+
+type Settings struct {
+	ID                             int64     `json:"id"`
+	PanelHost                      string    `json:"panel_host"`
+	PanelPort                      int       `json:"panel_port"`
+	PasswordHash                   string    `json:"-"`
+	SpeedTestEnabled               bool      `json:"speed_test_enabled"`
+	LatencyTestURL                 string    `json:"latency_test_url"`
+	SpeedTestURL                   string    `json:"speed_test_url"`
+	LatencyTimeoutMS               int       `json:"latency_timeout_ms"`
+	SpeedTimeoutMS                 int       `json:"speed_timeout_ms"`
+	LatencyConcurrency             int       `json:"latency_concurrency"`
+	SpeedConcurrency               int       `json:"speed_concurrency"`
+	DefaultSubscriptionIntervalSec int       `json:"default_subscription_interval_sec"`
+	MihomoControllerSecret         string    `json:"mihomo_controller_secret"`
+	FailureRetryCount              int       `json:"failure_retry_count"`
+	LogLevel                       string    `json:"log_level"`
+	SpeedMaxBytes                  int64     `json:"speed_max_bytes"`
+	CreatedAt                      time.Time `json:"created_at"`
+	UpdatedAt                      time.Time `json:"updated_at"`
+}
+
+type Subscription struct {
+	ID              int64      `json:"id"`
+	Name            string     `json:"name"`
+	URL             string     `json:"url"`
+	HeadersJSON     string     `json:"headers_json"`
+	Enabled         bool       `json:"enabled"`
+	SyncIntervalSec int        `json:"sync_interval_sec"`
+	LastSyncAt      *time.Time `json:"last_sync_at"`
+	LastSyncStatus  string     `json:"last_sync_status"`
+	LastError       string     `json:"last_error"`
+	ETag            string     `json:"etag"`
+	LastModified    string     `json:"last_modified"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
+type SubscriptionNode struct {
+	ID             int64      `json:"id"`
+	SubscriptionID int64      `json:"subscription_id"`
+	DisplayName    string     `json:"display_name"`
+	Protocol       string     `json:"protocol"`
+	Server         string     `json:"server"`
+	Port           int        `json:"port"`
+	RawPayload     string     `json:"raw_payload"`
+	NormalizedJSON string     `json:"normalized_json"`
+	Enabled        bool       `json:"enabled"`
+	LastLatencyMS  *int64     `json:"last_latency_ms"`
+	LastSpeedMbps  *float64   `json:"last_speed_mbps"`
+	LastStatus     string     `json:"last_status"`
+	LastTestAt     *time.Time `json:"last_test_at"`
+	LastSpeedAt    *time.Time `json:"last_speed_at"`
+	LastError      string     `json:"last_error"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+type ManualNode struct {
+	ID             int64      `json:"id"`
+	DisplayName    string     `json:"display_name"`
+	Protocol       string     `json:"protocol"`
+	Server         string     `json:"server"`
+	Port           int        `json:"port"`
+	RawPayload     string     `json:"raw_payload"`
+	NormalizedJSON string     `json:"normalized_json"`
+	Enabled        bool       `json:"enabled"`
+	LastLatencyMS  *int64     `json:"last_latency_ms"`
+	LastSpeedMbps  *float64   `json:"last_speed_mbps"`
+	LastStatus     string     `json:"last_status"`
+	LastTestAt     *time.Time `json:"last_test_at"`
+	LastSpeedAt    *time.Time `json:"last_speed_at"`
+	LastError      string     `json:"last_error"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
+}
+
+type ProxyPool struct {
+	ID                  int64      `json:"id"`
+	Name                string     `json:"name"`
+	Protocol            string     `json:"protocol"`
+	ListenHost          string     `json:"listen_host"`
+	ListenPort          int        `json:"listen_port"`
+	AuthEnabled         bool       `json:"auth_enabled"`
+	AuthUsername        string     `json:"auth_username"`
+	AuthPasswordSecret  string     `json:"auth_password_secret,omitempty"`
+	Strategy            string     `json:"strategy"`
+	FailoverEnabled     bool       `json:"failover_enabled"`
+	Enabled             bool       `json:"enabled"`
+	LastPublishedAt     *time.Time `json:"last_published_at"`
+	LastPublishStatus   string     `json:"last_publish_status"`
+	LastError           string     `json:"last_error"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+	CurrentMemberCount  int        `json:"current_member_count"`
+	CurrentHealthyCount int        `json:"current_healthy_count"`
+}
+
+type ProxyPoolMember struct {
+	ID           int64     `json:"id"`
+	PoolID       int64     `json:"pool_id"`
+	SourceType   string    `json:"source_type"`
+	SourceNodeID int64     `json:"source_node_id"`
+	Enabled      bool      `json:"enabled"`
+	Weight       int       `json:"weight"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+}
+
+type ProbeHistory struct {
+	ID           int64     `json:"id"`
+	SourceType   string    `json:"source_type"`
+	SourceNodeID int64     `json:"source_node_id"`
+	TestType     string    `json:"test_type"`
+	Success      bool      `json:"success"`
+	LatencyMS    *int64    `json:"latency_ms"`
+	SpeedMbps    *float64  `json:"speed_mbps"`
+	ErrorMessage string    `json:"error_message"`
+	TestedAt     time.Time `json:"tested_at"`
+}
+
+type RuntimeNode struct {
+	SourceType     string `json:"source_type"`
+	SourceNodeID   int64  `json:"source_node_id"`
+	DisplayName    string `json:"display_name"`
+	Protocol       string `json:"protocol"`
+	Server         string `json:"server"`
+	Port           int    `json:"port"`
+	RawPayload     string `json:"raw_payload"`
+	NormalizedJSON string `json:"normalized_json"`
+	Enabled        bool   `json:"enabled"`
+	LastStatus     string `json:"last_status"`
+}
+
+type PoolMemberView struct {
+	SourceType    string   `json:"source_type"`
+	SourceNodeID  int64    `json:"source_node_id"`
+	DisplayName   string   `json:"display_name"`
+	Protocol      string   `json:"protocol"`
+	Server        string   `json:"server"`
+	Port          int      `json:"port"`
+	Enabled       bool     `json:"enabled"`
+	LastStatus    string   `json:"last_status"`
+	LastLatencyMS *int64   `json:"last_latency_ms"`
+	LastSpeedMbps *float64 `json:"last_speed_mbps"`
+	SourceLabel   string   `json:"source_label"`
+}

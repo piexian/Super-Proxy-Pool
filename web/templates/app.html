@@ -1,0 +1,198 @@
+{{define "body"}}
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand">Super-Proxy-Pool</div>
+    <nav class="nav-links">
+      <a class="{{if eq .Page `subscriptions`}}active{{end}}" href="/subscriptions">订阅管理</a>
+      <a class="{{if eq .Page `manual-nodes`}}active{{end}}" href="/manual-nodes">节点管理</a>
+      <a class="{{if eq .Page `pools`}}active{{end}}" href="/pools">代理池设置</a>
+      <a class="{{if eq .Page `settings`}}active{{end}}" href="/settings">系统设置</a>
+    </nav>
+    <button id="logoutButton" class="ghost-button">退出登录</button>
+  </aside>
+  <main class="content">
+    <header class="page-header">
+      <div>
+        <h1>{{.Heading}}</h1>
+        <p>{{.Description}}</p>
+      </div>
+    </header>
+
+    {{if eq .Page "subscriptions"}}
+    <section class="panel-grid">
+      <article class="panel-card form-card">
+        <h2>新增 / 编辑订阅</h2>
+        <form id="subscriptionForm" class="stack-form">
+          <input type="hidden" name="id">
+          <label><span>订阅名称</span><input name="name" required></label>
+          <label><span>订阅 URL</span><input name="url" required></label>
+          <label><span>自定义请求头 JSON</span><textarea name="headers_json" rows="4" placeholder='{"User-Agent":"mihomo"}'></textarea></label>
+          <label><span>自动同步间隔（秒）</span><input type="number" name="sync_interval_sec" value="3600" min="0"></label>
+          <label class="inline"><input type="checkbox" name="enabled" checked> 启用订阅</label>
+          <div class="form-actions">
+            <button type="submit">保存订阅</button>
+            <button type="button" class="secondary" id="subscriptionFormReset">清空</button>
+          </div>
+        </form>
+      </article>
+      <article class="panel-card">
+        <div class="toolbar">
+          <input id="subscriptionSearch" placeholder="搜索订阅名称或链接">
+        </div>
+        <div id="subscriptionList" class="card-list"></div>
+      </article>
+    </section>
+    {{end}}
+
+    {{if eq .Page "subscription-detail"}}
+    <section class="panel-card">
+      <div class="toolbar">
+        <a class="secondary-link" href="/subscriptions">返回订阅列表</a>
+        <button id="subscriptionSyncSingleButton">立即同步</button>
+      </div>
+      <div id="subscriptionDetailMeta" class="meta-strip"></div>
+      <div class="toolbar">
+        <input id="subscriptionNodeSearch" placeholder="搜索节点">
+      </div>
+      <div id="subscriptionNodeList" class="card-list"></div>
+    </section>
+    {{end}}
+
+    {{if eq .Page "manual-nodes"}}
+    <section class="panel-grid">
+      <article class="panel-card form-card">
+        <h2>新增 / 编辑手动节点</h2>
+        <form id="manualNodeForm" class="stack-form">
+          <input type="hidden" name="id">
+          <label><span>节点内容</span><textarea name="content" rows="10" placeholder="支持单条或多条 URI，也支持 Mihomo YAML 片段" required></textarea></label>
+          <div class="form-actions">
+            <button type="submit">保存节点</button>
+            <button type="button" class="secondary" id="manualNodeFormReset">清空</button>
+          </div>
+        </form>
+      </article>
+      <article class="panel-card">
+        <div class="toolbar">
+          <input id="manualNodeSearch" placeholder="搜索节点名 / 地址 / 协议">
+        </div>
+        <div id="manualNodeList" class="card-list"></div>
+      </article>
+    </section>
+    {{end}}
+
+    {{if eq .Page "pools"}}
+    <section class="panel-grid">
+      <article class="panel-card form-card">
+        <h2>新增 / 编辑代理池</h2>
+        <form id="poolForm" class="stack-form">
+          <input type="hidden" name="id">
+          <label><span>名称</span><input name="name" required></label>
+          <label><span>协议</span>
+            <select name="protocol">
+              <option value="http">HTTP</option>
+              <option value="socks">SOCKS</option>
+            </select>
+          </label>
+          <label><span>监听地址</span><input name="listen_host" value="0.0.0.0"></label>
+          <label><span>监听端口</span><input type="number" name="listen_port" required></label>
+          <label class="inline"><input type="checkbox" name="auth_enabled"> 启用认证</label>
+          <label><span>用户名</span><input name="auth_username"></label>
+          <label><span>密码</span><input name="auth_password_secret"></label>
+          <label><span>调度策略</span>
+            <select name="strategy">
+              <option value="round_robin">round_robin</option>
+              <option value="lowest_latency">lowest_latency</option>
+              <option value="failover">failover</option>
+              <option value="sticky">sticky</option>
+            </select>
+          </label>
+          <label class="inline"><input type="checkbox" name="failover_enabled" checked> 失败切换</label>
+          <label class="inline"><input type="checkbox" name="enabled" checked> 启用代理池</label>
+          <div class="member-selector">
+            <div class="toolbar">
+              <input id="poolMemberSearch" placeholder="搜索候选节点">
+              <select id="poolMemberSourceFilter">
+                <option value="">全部来源</option>
+                <option value="manual">手动节点</option>
+                <option value="subscription">订阅节点</option>
+              </select>
+              <select id="poolMemberProtocolFilter">
+                <option value="">全部协议</option>
+                <option value="ss">ss</option>
+                <option value="trojan">trojan</option>
+                <option value="vmess">vmess</option>
+                <option value="vless">vless</option>
+                <option value="tuic">tuic</option>
+                <option value="hysteria2">hysteria2</option>
+              </select>
+              <select id="poolMemberStatusFilter">
+                <option value="">全部状态</option>
+                <option value="available">可用</option>
+                <option value="unknown">未知</option>
+                <option value="unavailable">不可用</option>
+              </select>
+            </div>
+            <button type="button" class="secondary" id="poolMemberSelectFiltered">全选当前筛选结果</button>
+            <div id="poolMemberList" class="member-list"></div>
+          </div>
+          <div class="form-actions">
+            <button type="submit">保存代理池</button>
+            <button type="button" class="secondary" id="poolFormReset">清空</button>
+          </div>
+        </form>
+      </article>
+      <article class="panel-card">
+        <div id="poolList" class="card-list"></div>
+      </article>
+    </section>
+    {{end}}
+
+    {{if eq .Page "settings"}}
+    <section class="panel-grid">
+      <article class="panel-card form-card">
+        <h2>系统设置</h2>
+        <form id="settingsForm" class="stack-form">
+          <label><span>面板监听地址</span><input name="panel_host" required></label>
+          <label><span>面板监听端口</span><input type="number" name="panel_port" required></label>
+          <label class="inline"><input type="checkbox" name="speed_test_enabled"> 开启测速显示</label>
+          <label><span>延迟测试 URL</span><input name="latency_test_url" required></label>
+          <label><span>延迟测试超时（毫秒）</span><input type="number" name="latency_timeout_ms" required></label>
+          <label><span>延迟测试并发</span><input type="number" name="latency_concurrency" required></label>
+          <label><span>测速下载 URL</span><input name="speed_test_url" required></label>
+          <label><span>测速超时（毫秒）</span><input type="number" name="speed_timeout_ms" required></label>
+          <label><span>测速并发</span><input type="number" name="speed_concurrency" required></label>
+          <label><span>测速字节上限</span><input type="number" name="speed_max_bytes" required></label>
+          <label><span>默认订阅同步间隔（秒）</span><input type="number" name="default_subscription_interval_sec" required></label>
+          <label><span>Mihomo Controller Secret</span><input name="mihomo_controller_secret" required></label>
+          <label><span>失败重试次数</span><input type="number" name="failure_retry_count" required></label>
+          <label><span>日志级别</span>
+            <select name="log_level">
+              <option value="debug">debug</option>
+              <option value="info">info</option>
+              <option value="warning">warning</option>
+              <option value="error">error</option>
+            </select>
+          </label>
+          <div class="form-actions">
+            <button type="submit">保存设置</button>
+          </div>
+        </form>
+      </article>
+      <article class="panel-card form-card">
+        <h2>修改密码</h2>
+        <form id="passwordForm" class="stack-form">
+          <label><span>旧密码</span><input type="password" name="old_password" required></label>
+          <label><span>新密码</span><input type="password" name="new_password" required></label>
+          <button type="submit">修改密码</button>
+        </form>
+        <div class="danger-zone">
+          <h3>危险操作区</h3>
+          <p>保存配置后点击重启，Docker restart policy 可自动拉起容器。</p>
+          <button id="restartButton" class="danger">重启系统</button>
+        </div>
+      </article>
+    </section>
+    {{end}}
+  </main>
+</div>
+{{end}}
