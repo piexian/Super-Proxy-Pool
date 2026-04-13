@@ -8,6 +8,7 @@ import (
 
 	"super-proxy-pool/internal/db"
 	"super-proxy-pool/internal/events"
+	"super-proxy-pool/internal/mihomo"
 	"super-proxy-pool/internal/models"
 	"super-proxy-pool/internal/nodes"
 	"super-proxy-pool/internal/settings"
@@ -19,6 +20,7 @@ type Service struct {
 	settingsSvc   *settings.Service
 	manualNodes   *nodes.Service
 	subscriptions *subscriptions.Service
+	mihomo        *mihomo.Manager
 	events        *events.Broker
 }
 
@@ -42,12 +44,13 @@ type MemberInput struct {
 	Weight       int    `json:"weight"`
 }
 
-func NewService(store *db.Store, settingsSvc *settings.Service, manualNodes *nodes.Service, subscriptions *subscriptions.Service, broker *events.Broker) *Service {
+func NewService(store *db.Store, settingsSvc *settings.Service, manualNodes *nodes.Service, subscriptions *subscriptions.Service, mihomoMgr *mihomo.Manager, broker *events.Broker) *Service {
 	return &Service{
 		store:         store,
 		settingsSvc:   settingsSvc,
 		manualNodes:   manualNodes,
 		subscriptions: subscriptions,
+		mihomo:        mihomoMgr,
 		events:        broker,
 	}
 }
@@ -213,10 +216,57 @@ func (s *Service) AvailableCandidates(ctx context.Context) ([]models.PoolMemberV
 }
 
 func (s *Service) Publish(ctx context.Context, poolID int64) error {
-	_, err := s.store.DB.ExecContext(ctx, `UPDATE proxy_pools SET last_published_at = ?, last_publish_status = ?, last_error = ?, updated_at = ? WHERE id = ?`,
-		time.Now().UTC(), "queued", "", time.Now().UTC(), poolID)
+	_ = poolID
+	settingsRow, err := s.settingsSvc.Get(ctx)
+	if err != nil {
+		return err
+	}
+	poolList, err := s.List(ctx)
+	if err != nil {
+		return err
+	}
+	manualInventory, err := s.manualNodes.AllRuntimeNodes(ctx)
+	if err != nil {
+		return err
+	}
+	subscriptionInventory, err := s.subscriptions.AllRuntimeNodes(ctx)
+	if err != nil {
+		return err
+	}
+	inventory := append(manualInventory, subscriptionInventory...)
+
+	members := make(map[int64][]models.RuntimeNode)
+	for _, pool := range poolList {
+		currentMembers, err := s.runtimeMembersForPool(ctx, pool.ID)
+		if err != nil {
+			return err
+		}
+		members[pool.ID] = currentMembers
+	}
+
+	bundle, err := BuildPublishBundle(
+		settingsRow.MihomoControllerSecret,
+		s.mihomo.ProdControllerAddr(),
+		s.mihomo.ProbeControllerAddr(),
+		s.mihomo.ProbeMixedPort(),
+		settingsRow.LatencyTestURL,
+		poolList,
+		members,
+		inventory,
+	)
+	if err != nil {
+		return err
+	}
+	if err := s.mihomo.ApplyProdConfig(bundle.ProdConfig); err != nil {
+		return err
+	}
+	if err := s.mihomo.ApplyProbeConfig(bundle.ProbeConfig); err != nil {
+		return err
+	}
+	_, err = s.store.DB.ExecContext(ctx, `UPDATE proxy_pools SET last_published_at = ?, last_publish_status = ?, last_error = ?, updated_at = ?`,
+		time.Now().UTC(), "published", "", time.Now().UTC())
 	if err == nil {
-		s.events.Publish("pools.publish.queued", map[string]int64{"pool_id": poolID})
+		s.events.Publish("pools.published", map[string]string{"status": "published"})
 	}
 	return err
 }
@@ -231,6 +281,39 @@ func (s *Service) validatePort(ctx context.Context, candidatePort int, currentID
 		return err
 	}
 	return ValidatePortConflict(settingsRow.PanelPort, pools, currentID, candidatePort)
+}
+
+func (s *Service) runtimeMembersForPool(ctx context.Context, poolID int64) ([]models.RuntimeNode, error) {
+	memberRows, err := s.store.DB.QueryContext(ctx, `SELECT source_type, source_node_id, enabled FROM proxy_pool_members WHERE pool_id = ?`, poolID)
+	if err != nil {
+		return nil, err
+	}
+	defer memberRows.Close()
+
+	var result []models.RuntimeNode
+	for memberRows.Next() {
+		var sourceType string
+		var sourceNodeID int64
+		var enabled int
+		if err := memberRows.Scan(&sourceType, &sourceNodeID, &enabled); err != nil {
+			return nil, err
+		}
+		if enabled == 0 {
+			continue
+		}
+		if sourceType == "manual" {
+			node, err := s.manualNodes.NodeBySource(ctx, sourceNodeID)
+			if err == nil {
+				result = append(result, node)
+			}
+			continue
+		}
+		node, err := s.subscriptions.NodeBySource(ctx, sourceNodeID)
+		if err == nil {
+			result = append(result, node)
+		}
+	}
+	return result, memberRows.Err()
 }
 
 func ValidatePortConflict(panelPort int, pools []models.ProxyPool, currentID int64, candidatePort int) error {

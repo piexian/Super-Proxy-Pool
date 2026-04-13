@@ -58,7 +58,7 @@ func main() {
 		ProbeMixedPort:      cfg.ProbeMixedPort,
 	})
 	probeSvc := probe.NewService(broker)
-	poolSvc := pools.NewService(store, settingsSvc, nodeSvc, subSvc, broker)
+	poolSvc := pools.NewService(store, settingsSvc, nodeSvc, subSvc, mihomoMgr, broker)
 
 	currentSettings, err := settingsSvc.Get(context.Background())
 	if err != nil {
