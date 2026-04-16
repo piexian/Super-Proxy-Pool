@@ -299,33 +299,33 @@ func (s *Service) validateUpsertRequest(ctx context.Context, currentID int64, re
 }
 
 func (s *Service) validateUniqueUsername(ctx context.Context, currentID int64, username string) error {
-	pools, err := s.List(ctx)
+	var count int
+	err := s.store.DB.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM proxy_pools WHERE auth_username = ? AND id != ?`, username, currentID,
+	).Scan(&count)
 	if err != nil {
 		return err
 	}
-	for _, pool := range pools {
-		if pool.ID == currentID {
-			continue
-		}
-		if pool.AuthUsername == username {
-			return fmt.Errorf("username %q is already used by pool %q", username, pool.Name)
-		}
+	if count > 0 {
+		return fmt.Errorf("username %q is already used by another pool", username)
 	}
 	return nil
 }
 
 // LookupPoolByAuth finds an enabled pool by username and password.
 func (s *Service) LookupPoolByAuth(ctx context.Context, username, password string) (*models.ProxyPool, error) {
-	pools, err := s.List(ctx)
+	row := s.store.DB.QueryRowContext(ctx, `SELECT id, name, auth_username,
+		auth_password_secret, strategy, failover_enabled, enabled, last_published_at, last_publish_status, last_error,
+		created_at, updated_at, 0, 0 FROM proxy_pools WHERE enabled = 1 AND auth_username = ? AND auth_password_secret = ? LIMIT 1`,
+		username, password)
+	item, err := scanPool(row)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	for _, pool := range pools {
-		if pool.Enabled && pool.AuthUsername == username && pool.AuthPasswordSecret == password {
-			return &pool, nil
-		}
-	}
-	return nil, nil
+	return &item, nil
 }
 
 func (s *Service) runtimeMembersForPool(ctx context.Context, poolID int64) ([]models.RuntimeNode, error) {
@@ -380,18 +380,6 @@ func (s *Service) markPublishFailure(ctx context.Context, cause error) {
 	_, _ = s.store.DB.ExecContext(ctx, `UPDATE proxy_pools SET last_publish_status = ?, last_error = ?, updated_at = ?`,
 		"failed", cause.Error(), time.Now().UTC())
 	s.events.Publish("pools.publish.failed", map[string]string{"error": cause.Error()})
-}
-
-func ValidateUsernameUnique(pools []models.ProxyPool, currentID int64, username string) error {
-	for _, pool := range pools {
-		if pool.ID == currentID {
-			continue
-		}
-		if pool.AuthUsername == username {
-			return fmt.Errorf("username %q is already used by pool %q", username, pool.Name)
-		}
-	}
-	return nil
 }
 
 func scanPool(scanner interface{ Scan(dest ...any) error }) (models.ProxyPool, error) {

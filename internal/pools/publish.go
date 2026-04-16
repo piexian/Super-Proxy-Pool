@@ -123,7 +123,11 @@ func buildProdConfig(secret, controller, testURL, logLevel string, poolList []mo
 
 // InternalPort returns the internal Mihomo listener port for a pool.
 func InternalPort(poolID int64) int {
-	return 30000 + int(poolID)
+	port := 30000 + int(poolID)
+	if port < 1 || port > 65535 {
+		panic(fmt.Sprintf("pool ID %d maps to invalid port %d", poolID, port))
+	}
+	return port
 }
 
 func buildProbeConfig(secret, controller string, probeMixedPort int, logLevel string, inventory []models.RuntimeNode) ([]byte, error) {

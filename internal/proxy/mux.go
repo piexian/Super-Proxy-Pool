@@ -25,6 +25,9 @@ type Mux struct {
 	ctx        context.Context
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
+
+	mu          sync.Mutex
+	activeConns map[net.Conn]struct{}
 }
 
 func NewMux(poolSvc *pools.Service, httpHandler http.Handler, addr string) (*Mux, error) {
@@ -34,10 +37,11 @@ func NewMux(poolSvc *pools.Service, httpHandler http.Handler, addr string) (*Mux
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Mux{
-		pools:    poolSvc,
-		listener: ln,
-		ctx:      ctx,
-		cancel:   cancel,
+		pools:       poolSvc,
+		listener:    ln,
+		ctx:         ctx,
+		cancel:      cancel,
+		activeConns: make(map[net.Conn]struct{}),
 	}
 	// The HTTP server serves connections that are forwarded via peekedListener
 	m.httpServer = &http.Server{
@@ -60,7 +64,9 @@ func (m *Mux) Serve() error {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
-		_ = m.httpServer.Serve(pl)
+		if err := m.httpServer.Serve(pl); err != nil && err != http.ErrServerClosed {
+			log.Printf("proxy mux: http server error: %v", err)
+		}
 	}()
 
 	for {
@@ -84,9 +90,29 @@ func (m *Mux) Serve() error {
 func (m *Mux) Shutdown(ctx context.Context) error {
 	m.cancel()
 	_ = m.listener.Close()
+
+	// Close all tracked active proxy connections so relay goroutines unblock
+	m.mu.Lock()
+	for c := range m.activeConns {
+		_ = c.Close()
+	}
+	m.mu.Unlock()
+
 	err := m.httpServer.Shutdown(ctx)
 	m.wg.Wait()
 	return err
+}
+
+func (m *Mux) trackConn(c net.Conn) {
+	m.mu.Lock()
+	m.activeConns[c] = struct{}{}
+	m.mu.Unlock()
+}
+
+func (m *Mux) untrackConn(c net.Conn) {
+	m.mu.Lock()
+	delete(m.activeConns, c)
+	m.mu.Unlock()
 }
 
 func (m *Mux) handleConn(conn net.Conn, httpConns chan<- net.Conn) {
@@ -105,8 +131,9 @@ func (m *Mux) handleConn(conn net.Conn, httpConns chan<- net.Conn) {
 		return
 	}
 
-	// Peek more to check if this is an HTTP proxy request
-	line, err := br.Peek(min(br.Buffered()+512, 4096))
+	// Peek a small amount to check if this is an HTTP proxy request.
+	// Only peek what's already buffered + a small amount to avoid blocking.
+	line, err := br.Peek(min(br.Buffered()+32, 4096))
 	if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
 		conn.Close()
 		return
@@ -119,8 +146,16 @@ func (m *Mux) handleConn(conn net.Conn, httpConns chan<- net.Conn) {
 		return
 	}
 
-	// Regular HTTP → pass to HTTP server
-	httpConns <- pc
+	// Regular HTTP → pass to HTTP server. Avoid blocking indefinitely if the
+	// queue is full or the mux is shutting down.
+	select {
+	case httpConns <- pc:
+	case <-m.ctx.Done():
+		_ = pc.Close()
+	default:
+		_, _ = pc.Write([]byte("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"))
+		_ = pc.Close()
+	}
 }
 
 func isHTTPProxyRequest(firstLine string) bool {
@@ -202,7 +237,7 @@ func (m *Mux) handleSOCKS5(conn *peekedConn) {
 	}
 	conn.Write([]byte{0x01, 0x00}) // Auth success
 
-	// Connect to internal Mihomo SOCKS5 listener and relay the rest
+	// Connect to internal Mihomo listener and relay the rest
 	internalAddr := fmt.Sprintf("127.0.0.1:%d", pools.InternalPort(pool.ID))
 	upstream, err := net.DialTimeout("tcp", internalAddr, 5*time.Second)
 	if err != nil {
@@ -213,12 +248,56 @@ func (m *Mux) handleSOCKS5(conn *peekedConn) {
 	}
 	defer upstream.Close()
 
-	// Handshake with internal Mihomo as SOCKS5 no-auth client
-	upstream.Write([]byte{0x05, 0x01, 0x00}) // version=5, 1 method, no-auth
-	gresp := make([]byte, 2)
-	if _, err := io.ReadFull(upstream, gresp); err != nil {
+	// Handshake with internal Mihomo SOCKS5 listener.
+	// Offer both no-auth (0x00) and username/password (0x02).
+	if _, err := upstream.Write([]byte{0x05, 0x02, 0x00, 0x02}); err != nil {
+		log.Printf("proxy mux: failed to write SOCKS5 greeting to internal %s: %v", internalAddr, err)
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+	gresp := make([]byte, 2)
+	if _, err := io.ReadFull(upstream, gresp); err != nil {
+		log.Printf("proxy mux: failed to read SOCKS5 greeting response from internal %s: %v", internalAddr, err)
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	if gresp[0] != 0x05 {
+		log.Printf("proxy mux: invalid SOCKS5 version from internal %s: %d", internalAddr, gresp[0])
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	switch gresp[1] {
+	case 0x00:
+		// No authentication required — proceed
+	case 0x02:
+		// Perform RFC 1929 username/password auth with internal listener
+		authReq := make([]byte, 0, 3+len(username)+len(password))
+		authReq = append(authReq, 0x01, byte(len(username)))
+		authReq = append(authReq, username...)
+		authReq = append(authReq, byte(len(password)))
+		authReq = append(authReq, password...)
+		if _, err := upstream.Write(authReq); err != nil {
+			log.Printf("proxy mux: failed to write RFC1929 auth to internal %s: %v", internalAddr, err)
+			conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(upstream, authResp); err != nil || authResp[0] != 0x01 || authResp[1] != 0x00 {
+			log.Printf("proxy mux: internal SOCKS5 auth failed for %s", internalAddr)
+			conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+	default:
+		log.Printf("proxy mux: unsupported SOCKS5 auth method from internal %s: %d", internalAddr, gresp[1])
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	// Track connections for graceful shutdown
+	m.trackConn(conn)
+	m.trackConn(upstream)
+	defer m.untrackConn(conn)
+	defer m.untrackConn(upstream)
 
 	// Now relay: client's SOCKS5 request/reply and all subsequent data go straight through
 	relay(conn, upstream)
@@ -258,6 +337,12 @@ func (m *Mux) handleHTTPProxy(conn *peekedConn, firstLine string) {
 	}
 	defer upstream.Close()
 
+	// Track connections for graceful shutdown
+	m.trackConn(conn)
+	m.trackConn(upstream)
+	defer m.untrackConn(conn)
+	defer m.untrackConn(upstream)
+
 	// Relay everything from buffered conn to upstream (and back)
 	relay(conn, upstream)
 }
@@ -289,18 +374,19 @@ func relay(a, b net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
 		io.Copy(b, a)
-		if tc, ok := b.(*net.TCPConn); ok {
-			tc.CloseWrite()
+		if cw, ok := b.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
 		io.Copy(a, b)
-		if tc, ok := a.(interface{ CloseWrite() error }); ok {
-			tc.CloseWrite()
+		if cw, ok := a.(interface{ CloseWrite() error }); ok {
+			cw.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
+	<-done
 	<-done
 }
 
@@ -312,6 +398,13 @@ type peekedConn struct {
 
 func (c *peekedConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
+}
+
+func (c *peekedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 // peekedListener feeds pre-accepted connections from a channel into http.Server.Serve.
